@@ -181,3 +181,112 @@ def test_parallel_different_meters_through_independent_connections(clean_db):
         assert conn.execute(
             "SELECT count(*) c FROM interval_consistency_report()"
         ).fetchone()["c"] == 0
+
+
+def test_interleaved_reading_and_work_order_writes_stay_consistent(clean_db):
+    """同一只表上读数与工单交错提交 (等效并发串行化后的最终状态):
+
+    任意交错顺序下, 持久化补算子段必须始终与当前缺测段/工单推导一致,
+    旧补算不得残留 (验证同事务撤下)。
+    """
+    meter = "M-WO-CONC"
+    conn = _direct_conn()
+    try:
+        # 缺测段 (01:00,03:00]
+        conn.execute(
+            "SELECT insert_reading(%s,%s::timestamptz,%s,false)",
+            (meter, "2026-06-02 01:00+00", 1000),
+        )
+        conn.execute(
+            "SELECT insert_reading(%s,%s::timestamptz,%s,true)",
+            (meter, "2026-06-02 03:00+00", 200),
+        )
+        conn.commit()
+
+        steps = [
+            ("wo", "2026-06-02 02:00+00", 1500, 100),   # 登记工单 -> 2 段补算
+            ("read", "2026-06-02 02:30+00", 150, True),  # 补录换表首读, 缺测段再拆
+            ("wo_fix", "2026-06-02 02:00+00", 1600, 120),  # 同刻更正
+            ("read_del", "2026-06-02 02:30+00", None, None),  # 删读数, 缺测段合并
+            ("wo2", "2026-06-02 01:30+00", 1200, 1100),  # 再登记一个工单
+        ]
+        for op, ts, a, b in steps:
+            if op == "wo" or op == "wo_fix":
+                conn.execute(
+                    "SELECT upsert_work_order(%s,%s::timestamptz,%s,%s)",
+                    (meter, ts, a, b),
+                )
+            elif op == "wo2":
+                conn.execute(
+                    "SELECT upsert_work_order(%s,%s::timestamptz,%s,%s)",
+                    (meter, ts, a, b),
+                )
+            elif op == "read":
+                conn.execute(
+                    "SELECT insert_reading(%s,%s::timestamptz,%s,true)",
+                    (meter, ts, a),
+                )
+            else:
+                conn.execute(
+                    "SELECT delete_reading(("
+                    "SELECT id FROM meter_readings WHERE meter_no=%s "
+                    "AND read_at=%s::timestamptz))",
+                    (meter, ts),
+                )
+            conn.commit()
+            # 每次提交后两类巡检都必须为 0 问题
+            assert conn.execute(
+                "SELECT count(*) FROM backfill_consistency_report() WHERE meter_no=%s",
+                (meter,),
+            ).fetchone()[0] == 0
+            assert conn.execute(
+                "SELECT count(*) FROM interval_consistency_report() WHERE meter_no=%s",
+                (meter,),
+            ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    # 最终: 缺测段 (01,03], 两个工单 (01:30, 02:00) => 3 个补算子段
+    with db.connection() as c:
+        gaps = c.execute(
+            "SELECT count(*) c FROM reading_intervals "
+            "WHERE meter_no=%s AND energy_wh IS NULL", (meter,)
+        ).fetchone()["c"]
+        assert gaps == 1
+        segs = c.execute(
+            "SELECT count(*) c, min(segment_index) lo, max(segment_index) hi "
+            "FROM backfill_segments WHERE meter_no=%s", (meter,)
+        ).fetchone()
+        assert (segs["c"], segs["lo"], segs["hi"]) == (3, 0, 2)
+
+
+def test_supply_reads_one_committed_snapshot(clean_db):
+    """/supply 在 REPEATABLE READ 快照内读数/缺测/补算/工单四类数据一致。"""
+    from app.db import db as _db
+
+    meter = "M-SNAP"
+    with _db.connection() as conn:
+        conn.execute("SELECT insert_reading(%s,'2026-06-03 01:00Z',1000,false)", (meter,))
+        conn.execute("SELECT insert_reading(%s,'2026-06-03 03:00Z',200,true)", (meter,))
+        conn.execute(
+            "SELECT upsert_work_order(%s,'2026-06-03 02:00Z',1500,100)", (meter,)
+        )
+    with _db.snapshot_connection() as conn:
+        level = conn.execute("SHOW transaction_isolation").fetchone()[
+            "transaction_isolation"
+        ]
+        assert level.lower() == "repeatable read"
+        readings = conn.execute(
+            "SELECT count(*) c FROM meter_readings WHERE meter_no=%s", (meter,)
+        ).fetchone()["c"]
+        missing = conn.execute(
+            "SELECT count(*) c FROM reading_intervals WHERE meter_no=%s AND energy_wh IS NULL",
+            (meter,),
+        ).fetchone()["c"]
+        segs = conn.execute(
+            "SELECT count(*) c FROM backfill_segments WHERE meter_no=%s", (meter,)
+        ).fetchone()["c"]
+        wos = conn.execute(
+            "SELECT count(*) c FROM meter_work_orders WHERE meter_no=%s", (meter,)
+        ).fetchone()["c"]
+        assert (readings, missing, segs, wos) == (2, 1, 2, 1)

@@ -48,7 +48,14 @@ def _database():
 
 @pytest.fixture()
 def clean_db():
-    """每个用例清空业务数据 (结构保留)。"""
+    """每个用例清空业务数据 (结构保留)。
+
+    backfill_segments 通过外键引用区间与工单, TRUNCATE 需带 CASCADE;
+    表名按 子表 -> 父表 排列, 单语句原子完成。
+    """
     with db.connection() as conn:
-        conn.execute("TRUNCATE reading_intervals, meter_readings, meters RESTART IDENTITY")
+        conn.execute(
+            "TRUNCATE backfill_segments, meter_work_orders, "
+            "reading_intervals, meter_readings, meters RESTART IDENTITY CASCADE"
+        )
     yield

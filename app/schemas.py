@@ -62,10 +62,74 @@ class IntervalOut(BaseModel):
     energy_wh: int | None = Field(None, description="区间电量 Wh; null=换表缺测")
 
 
+class WorkOrderCreate(BaseModel):
+    meter_no: str = Field(..., examples=["M-001"])
+    replaced_at: datetime = Field(
+        ..., examples=["2026-01-01T01:00:00Z"], description="UTC 换表时刻"
+    )
+    removal_reading: int = Field(
+        ..., ge=0, le=999999, description="拆除读数 (旧表末读), 整数 Wh, 0~999999"
+    )
+    install_reading: int = Field(
+        ..., ge=0, le=999999, description="装机读数 (新表首读), 整数 Wh, 0~999999"
+    )
+
+    _v_meter = field_validator("meter_no")(_validate_meter_no)
+    _v_time = field_validator("replaced_at")(_to_utc)
+
+
+class WorkOrderOut(BaseModel):
+    id: int
+    meter_no: str
+    replaced_at: datetime
+    removal_reading: int
+    install_reading: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkOrderUpsertOut(WorkOrderOut):
+    created: bool = Field(
+        ..., description="true=新登记工单; false=同表同刻重复提交, 已更正"
+    )
+
+
+class BackfillSegmentOut(BaseModel):
+    """换表缺测段的持久化补算子段。
+
+    端点来自原采样读数时, 对应的 work_order_at 为 null;
+    来自工单拆除/装机读数时, 为该工单的换表时刻。
+    """
+
+    meter_no: str
+    gap_end_read_at: datetime = Field(..., description="所属原始缺测段的右端时刻")
+    segment_index: int
+    start_read_at: datetime
+    end_read_at: datetime
+    start_reading: int
+    end_reading: int
+    energy_wh: int
+    start_work_order_at: datetime | None = Field(
+        None, description="左端工单时刻; null=左端取自原采样读数"
+    )
+    end_work_order_at: datetime | None = Field(
+        None, description="右端工单时刻; null=右端取自原采样读数"
+    )
+
+
 class SupplyResponse(BaseModel):
-    """同一完整提交快照下的读数与区间供数结果。"""
+    """同一完整提交快照下的读数、原始缺测与补算子段供数结果。"""
 
     meter_no: str
     snapshot_time: datetime = Field(..., description="本次供数使用的事务快照时间 (UTC)")
     readings: list[ReadingOut]
-    intervals: list[IntervalOut]
+    intervals: list[IntervalOut] = Field(
+        ..., description="全部区间; 其中 energy_wh=null 即原始换表缺测段"
+    )
+    missing_intervals: list[IntervalOut] = Field(
+        ..., description="原始缺测值 (energy_wh=null 的换表缺测段), 与补算子段分开返回"
+    )
+    backfill_segments: list[BackfillSegmentOut] = Field(
+        ..., description="持久化补算子段; 无适用工单的缺测段在此不出现"
+    )
+    work_orders: list[WorkOrderOut]

@@ -165,7 +165,8 @@ CREATE OR REPLACE FUNCTION insert_reading(
 ) RETURNS meter_readings
 LANGUAGE plpgsql AS $$
 DECLARE
-    v_row meter_readings%ROWTYPE;
+    v_row           meter_readings%ROWTYPE;
+    v_gap_ends_before TIMESTAMPTZ[];
 BEGIN
     PERFORM lock_meters(p_meter_no);
 
@@ -177,12 +178,18 @@ BEGIN
             USING ERRCODE = '23505';
     END IF;
 
+    -- 改动前快照被该时刻夹住的缺测段 (补录可能把缺测段一分为二)
+    v_gap_ends_before := _snapshot_gap_ends_near(p_meter_no, p_read_at);
+
     INSERT INTO meter_readings (meter_no, read_at, reading, replaced)
     VALUES (p_meter_no, p_read_at, p_reading, COALESCE(p_replaced, false))
     RETURNING * INTO v_row;
 
     -- 新行落位前不存在以 p_read_at 为端点的区间, 满足重排前置条件
     CALL _rebuild_local_intervals(p_meter_no, p_read_at);
+
+    -- 仅重建受影响缺测段的补算子段, 其余段不动
+    CALL _refresh_gap_backfills_around(p_meter_no, p_read_at, v_gap_ends_before);
 
     RETURN v_row;
 END;
@@ -200,8 +207,10 @@ CREATE OR REPLACE FUNCTION update_reading(
 ) RETURNS meter_readings
 LANGUAGE plpgsql AS $$
 DECLARE
-    v_old meter_readings%ROWTYPE;
-    v_row meter_readings%ROWTYPE;
+    v_old               meter_readings%ROWTYPE;
+    v_row               meter_readings%ROWTYPE;
+    v_gap_ends_before_old TIMESTAMPTZ[];
+    v_gap_ends_before_new TIMESTAMPTZ[];
 BEGIN
     -- 先普通查询定位 (不持读数行锁), 之后统一先锁电表再锁读数, 保证加锁顺序
     SELECT * INTO v_old
@@ -232,6 +241,10 @@ BEGIN
             USING ERRCODE = '23505';
     END IF;
 
+    -- 改动前分别快照旧位置、新位置相邻的缺测段 (改表号/改时刻可能跨段)
+    v_gap_ends_before_old := _snapshot_gap_ends_near(v_old.meter_no, v_old.read_at);
+    v_gap_ends_before_new := _snapshot_gap_ends_near(p_meter_no, p_read_at);
+
     -- 1) 从旧位置摘除 (改了电表号时, 旧表区间在此修正; 同表时移除两侧区间)
     CALL _detach_local_intervals(v_old.meter_no, v_old.read_at);
 
@@ -247,6 +260,17 @@ BEGIN
     -- 3) 在新位置落位重建 (新表区间在此修正)
     CALL _rebuild_local_intervals(p_meter_no, p_read_at);
 
+    -- 4) 仅重建旧位置、新位置受影响缺测段的补算子段
+    CALL _refresh_gap_backfills_around(
+        v_old.meter_no, v_old.read_at, v_gap_ends_before_old
+    );
+    IF p_meter_no IS DISTINCT FROM v_old.meter_no
+       OR p_read_at IS DISTINCT FROM v_old.read_at THEN
+        CALL _refresh_gap_backfills_around(
+            p_meter_no, p_read_at, v_gap_ends_before_new
+        );
+    END IF;
+
     RETURN v_row;
 END;
 $$;
@@ -258,7 +282,8 @@ CREATE OR REPLACE FUNCTION delete_reading(p_id BIGINT)
 RETURNS meter_readings
 LANGUAGE plpgsql AS $$
 DECLARE
-    v_old meter_readings%ROWTYPE;
+    v_old             meter_readings%ROWTYPE;
+    v_gap_ends_before TIMESTAMPTZ[];
 BEGIN
     SELECT * INTO v_old
       FROM meter_readings
@@ -276,9 +301,17 @@ BEGIN
      WHERE id = p_id
     FOR UPDATE;
 
+    -- 删除前快照相邻缺测段 (删除会合并相邻区间, 缺测身份可能变化)
+    v_gap_ends_before := _snapshot_gap_ends_near(v_old.meter_no, v_old.read_at);
+
     CALL _detach_local_intervals(v_old.meter_no, v_old.read_at);
 
     DELETE FROM meter_readings WHERE id = p_id;
+
+    -- 仅重建受影响缺测段的补算子段; 已消失的段其补算由外键级联同事务撤下
+    CALL _refresh_gap_backfills_around(
+        v_old.meter_no, v_old.read_at, v_gap_ends_before
+    );
 
     RETURN v_old;
 END;

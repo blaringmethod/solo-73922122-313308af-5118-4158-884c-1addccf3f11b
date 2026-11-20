@@ -39,7 +39,10 @@ def main() -> None:
     meter = "STRESS-M1"
     other = "STRESS-M2"
     with psycopg.connect(URL) as admin:
-        admin.execute("TRUNCATE reading_intervals, meter_readings, meters RESTART IDENTITY")
+        admin.execute(
+            "TRUNCATE backfill_segments, meter_work_orders, "
+            "reading_intervals, meter_readings, meters RESTART IDENTITY CASCADE"
+        )
         admin.execute("SELECT insert_reading(%s,'2026-07-01 00:00Z',0)", (meter,))
         admin.execute(
             "SELECT insert_reading(%s,'2026-07-01 11:00Z',11000)", (meter,)
